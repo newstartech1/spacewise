@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spacewise</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="intro-panel" aria-labelledby="page-title">
+        <div class="brand-row">
+          <span class="brand-mark" aria-hidden="true">S</span>
+          <span class="brand-name">Spacewise</span>
+        </div>
+
+        <div class="intro-copy">
+          <p class="eyebrow">For rooms people already live in</p>
+          <h1 id="page-title">Make your current room work better.</h1>
+          <p class="lede">
+            Upload a photo of an existing lived-in room, choose what you want
+            to improve, and Spacewise will help turn cluttered reality into
+            practical next steps.
+          </p>
+        </div>
+
+        <div class="status-strip" aria-live="polite">
+          <span class="status-dot" id="apiStatusDot"></span>
+          <span id="apiStatusText">API status not checked yet</span>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="Room improvement setup">
+        <div class="upload-panel">
+          <label class="upload-zone" for="roomPhoto">
+            <input id="roomPhoto" type="file" accept="image/*" />
+            <span class="upload-icon" aria-hidden="true">+</span>
+            <span class="upload-title">Upload a room photo</span>
+            <span class="upload-help">
+              Use a real photo of your current room, not an empty layout or new
+              construction plan.
+            </span>
+          </label>
+
+          <div class="preview-area" id="previewArea" hidden>
+            <img id="roomPreview" alt="Selected room preview" />
+            <button class="text-button" type="button" id="clearPhoto">
+              Remove photo
+            </button>
+          </div>
+        </div>
+
+        <div class="controls-panel">
+          <div class="section-heading">
+            <p class="eyebrow">Improvement goals</p>
+            <h2>What should Spacewise optimize for?</h2>
+          </div>
+
+          <fieldset class="goal-grid">
+            <legend class="sr-only">Select room improvement goals</legend>
+            <label class="goal-option">
+              <input type="checkbox" name="goals" value="More floor space" />
+              <span>More floor space</span>
+            </label>
+            <label class="goal-option">
+              <input type="checkbox" name="goals" value="Better lighting" />
+              <span>Better lighting</span>
+            </label>
+            <label class="goal-option">
+              <input type="checkbox" name="goals" value="Better workspace" />
+              <span>Better workspace</span>
+            </label>
+            <label class="goal-option">
+              <input type="checkbox" name="goals" value="Better appearance" />
+              <span>Better appearance</span>
+            </label>
+            <label class="goal-option">
+              <input type="checkbox" name="goals" value="Overall improvement" checked />
+              <span>Overall improvement</span>
+            </label>
+          </fieldset>
+
+          <button class="primary-button" type="button" id="analyzeButton">
+            Analyze room
+          </button>
+        </div>
+
+        <aside class="analysis-panel" aria-live="polite">
+          <div class="analysis-empty" id="analysisEmpty">
+            <p class="eyebrow">Room analysis</p>
+            <h2>Recommendations will appear here.</h2>
+            <p>
+              Upload a lived-in room photo, choose your goal, and Spacewise
+              will analyze the room through the backend.
+            </p>
+          </div>
+
+          <div class="analysis-loading" id="analysisLoading" hidden>
+            <span class="loader" aria-hidden="true"></span>
+            <div>
+              <p class="eyebrow">Analyzing</p>
+              <h2>Reading the room photo</h2>
+              <p id="analysisSummary">
+                Uploading to secure backend storage, checking room inventory,
+                and preparing recommendations.
+              </p>
+            </div>
+          </div>
+
+          <div class="analysis-error" id="analysisError" hidden>
+            <p class="eyebrow">Analysis blocked</p>
+            <h2>Spacewise could not complete the analysis.</h2>
+            <p id="analysisErrorText"></p>
+          </div>
+
+          <div class="analysis-results" id="analysisResults" hidden>
+            <div>
+              <p class="eyebrow">Selected goal</p>
+              <h2 id="resultGoal"></h2>
+            </div>
+
+            <div class="result-section">
+              <h3>Detected room inventory</h3>
+              <ul id="inventoryList"></ul>
+            </div>
+
+            <div class="result-section">
+              <h3>Practical recommendations</h3>
+              <ul id="recommendationList"></ul>
+            </div>
+
+            <div class="result-section">
+              <h3>Limitations and uncertainty</h3>
+              <ul id="limitationList"></ul>
+            </div>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
