@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -8,10 +9,14 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import urllib.request
 import urllib.error
 
-from assessment import build_assessment
+from backend.assessment import build_assessment
+
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -72,9 +77,10 @@ async def analyze_room(
 
     s3_key = _build_s3_key(photo.filename)
     s3_client = _aws_client("s3")
-    rekognition_client = _aws_client("rekognition")
 
     _verify_bucket_exists(s3_client, bucket_name)
+    bucket_region = _get_bucket_region(s3_client, bucket_name)
+    rekognition_client = _aws_client("rekognition", region_name=bucket_region)
     _upload_to_s3(s3_client, bucket_name, s3_key, image_bytes, photo.content_type)
     rekognition_analysis = _analyze_with_rekognition(
         rekognition_client,
@@ -107,8 +113,8 @@ async def analyze_room(
     }
 
 
-def _aws_client(service_name: str):
-    region_name = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+def _aws_client(service_name: str, region_name: str | None = None):
+    region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
     session = boto3.session.Session(region_name=region_name)
     return session.client(service_name)
 
@@ -139,6 +145,25 @@ def _verify_bucket_exists(s3_client, bucket_name: str) -> None:
         raise HTTPException(status_code=503, detail=detail) from exc
     except BotoCoreError as exc:
         raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
+
+
+def _get_bucket_region(s3_client, bucket_name: str) -> str:
+    try:
+        location = s3_client.get_bucket_location(Bucket=bucket_name).get("LocationConstraint")
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not determine the S3 bucket region required for Amazon Rekognition.",
+        ) from exc
+    except BotoCoreError as exc:
+        raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
+
+    # S3 represents us-east-1 as null and retained "EU" for its legacy region name.
+    if location is None:
+        return "us-east-1"
+    if location == "EU":
+        return "eu-west-1"
+    return str(location)
 
 
 def _upload_to_s3(
@@ -177,12 +202,21 @@ def _analyze_with_rekognition(
         )
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") == "InvalidParameterException":
-            response = rekognition_client.detect_labels(
-                Image=image,
-                MaxLabels=75,
-                MinConfidence=55,
-            )
+            _log_rekognition_client_error(exc, rekognition_client, "DetectLabels with image properties")
+            try:
+                response = rekognition_client.detect_labels(
+                    Image=image,
+                    MaxLabels=75,
+                    MinConfidence=55,
+                )
+            except ClientError as fallback_exc:
+                _log_rekognition_client_error(fallback_exc, rekognition_client, "DetectLabels fallback")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Amazon Rekognition could not analyze the uploaded image.",
+                ) from fallback_exc
         else:
+            _log_rekognition_client_error(exc, rekognition_client, "DetectLabels with image properties")
             raise HTTPException(
                 status_code=503,
                 detail="Amazon Rekognition could not analyze the uploaded image.",
@@ -194,6 +228,17 @@ def _analyze_with_rekognition(
         "detected_inventory": _extract_room_inventory(response.get("Labels", [])),
         "image_properties": _extract_image_properties(response.get("ImageProperties", {})),
     }
+
+
+def _log_rekognition_client_error(exc: ClientError, rekognition_client, operation: str) -> None:
+    error_code = str(exc.response.get("Error", {}).get("Code", "unknown"))
+    region_name = getattr(rekognition_client.meta, "region_name", "unknown")
+    logger.warning(
+        "Rekognition request failed: operation=%s error_code=%s region=%s",
+        operation,
+        error_code,
+        region_name,
+    )
 
 
 def _extract_room_inventory(labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -368,3 +413,9 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item).strip()]
+
+
+# Mount the existing static UI after API routes so /health, /analyze-room, and
+# /docs remain handled by FastAPI while / serves the browser application.
+FRONTEND_DIRECTORY = Path(__file__).resolve().parent.parent / "frontend"
+app.mount("/", StaticFiles(directory=FRONTEND_DIRECTORY, html=True), name="frontend")

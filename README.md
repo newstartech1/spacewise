@@ -30,6 +30,18 @@ The analysis flow is:
 Rekognition detections are approximate. Spacewise does not infer exact room
 dimensions or precise geometry from one photograph.
 
+## Assessment meters
+
+Each completed analysis returns five animated percentage meters: Design
+Confidence, Space Utilization, Budget Compatibility, Feasibility Confidence,
+and Overall Compatibility. Scores are deterministic: detected inventory,
+Rekognition confidence and image quality, selected goal count, and the number
+of deterministic/Gemini recommendations are the only inputs. Missing inventory
+uses fixed 35%/50%/60% baselines for design/utilization/budget; missing
+confidence uses a 55% feasibility baseline; missing image quality adds no
+quality adjustment. Overall Compatibility is a 30/25/20/25 weighted average.
+The API also returns these fallback rules with every assessment.
+
 ## Local Setup
 
 From the project root:
@@ -47,14 +59,14 @@ Configure local environment variables before using analysis:
 copy .env.example .env
 ```
 
-Set these values in your shell or load them from `.env` with your preferred
-local workflow:
+Set these values in your terminal session (PowerShell example):
 
 ```text
-AWS_REGION=us-east-1
-SPACEWISE_S3_BUCKET=your_existing_spacewise_bucket_name
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-1.5-flash
+$env:AWS_REGION="us-east-1"
+$env:SPACEWISE_S3_BUCKET="your_existing_spacewise_bucket_name"
+# Optional: enables Gemini-written recommendations; no key is required for deterministic analysis.
+$env:GEMINI_API_KEY="your_gemini_api_key"
+$env:GEMINI_MODEL="gemini-1.5-flash"
 ```
 
 AWS credentials should come from your local AWS CLI profile or environment. The
@@ -99,11 +111,7 @@ http://localhost:5500
 
 ## Environment Variables
 
-Create a local `.env` from `.env.example` when future integrations are added:
-
-```bash
-copy .env.example .env
-```
-
-Do not commit `.env`. API keys and AWS credentials must stay on the backend and
-must never be exposed to frontend JavaScript.
+Credentials and API keys must be terminal environment variables available only to
+the backend process; they must never be committed, hardcoded, or exposed to
+frontend JavaScript. Gemini is optional: without `GEMINI_API_KEY`, the API returns
+deterministic inventory-and-goal-based recommendations and assessments.
