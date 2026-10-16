@@ -6,14 +6,13 @@ from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
+import urllib.request
+import urllib.error
 
+from assessment import build_assessment
 
-load_dotenv()
 
 app = FastAPI(
     title="Spacewise API",
@@ -62,12 +61,7 @@ async def analyze_room(
             detail="Missing SPACEWISE_S3_BUCKET. Configure an existing S3 bucket before analysis.",
         )
 
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Missing GEMINI_API_KEY. Configure the backend environment before analysis.",
-        )
+    apertus_api_key = os.getenv("APERTUS_API_KEY")
 
     image_bytes = await photo.read()
     if not image_bytes:
@@ -87,11 +81,16 @@ async def analyze_room(
         bucket_name,
         s3_key,
     )
-    gemini_analysis = _analyze_with_gemini(
-        api_key=gemini_api_key,
-        selected_goal=goal,
-        rekognition_analysis=rekognition_analysis,
+    apertus_analysis = (
+        _analyze_with_apertus(
+            api_key=apertus_api_key,
+            selected_goal=goal,
+            rekognition_analysis=rekognition_analysis,
+        )
+        if apertus_api_key
+        else _deterministic_analysis_without_apertus(goal, rekognition_analysis)
     )
+    assessment = build_assessment(goal, rekognition_analysis, apertus_analysis["recommendations"])
 
     return {
         "selected_goal": goal,
@@ -101,9 +100,10 @@ async def analyze_room(
         },
         "detected_inventory": rekognition_analysis["detected_inventory"],
         "image_properties": rekognition_analysis["image_properties"],
-        "recommendations": gemini_analysis.get("recommendations", []),
-        "limitations": gemini_analysis.get("limitations", []),
-        "detected_facts": gemini_analysis.get("detected_facts", []),
+        "recommendations": apertus_analysis.get("recommendations", []),
+        "limitations": apertus_analysis.get("limitations", []),
+        "detected_facts": apertus_analysis.get("detected_facts", []),
+        "assessment": assessment,
     }
 
 
@@ -282,50 +282,80 @@ def _rounded_or_none(value: Any) -> float | None:
     return round(float(value), 1)
 
 
-def _analyze_with_gemini(
-    api_key: str,
-    selected_goal: str,
-    rekognition_analysis: dict[str, Any],
-) -> dict[str, Any]:
-    client = genai.Client(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+def _analyze_with_apertus(api_key: str, selected_goal: str, rekognition_analysis: dict[str, Any]) -> dict[str, Any]:
+    base_url = os.getenv("APERTUS_BASE_URL", "").rstrip("/")
+    model = os.getenv("APERTUS_MODEL", "")
+    if not base_url.startswith("https://") or not model:
+        raise HTTPException(status_code=503, detail="Configure HTTPS APERTUS_BASE_URL and APERTUS_MODEL.")
     prompt = {
-        "role": "Spacewise room improvement analyst",
-        "selected_goal": selected_goal,
+        "goal": selected_goal,
         "rekognition_analysis": rekognition_analysis,
         "instructions": [
-            "Recommend practical improvements for an already-lived-in room.",
-            "Respect existing furniture unless the user explicitly asks to replace something.",
-            "Do not fabricate objects that are not in the Rekognition data.",
-            "Do not claim exact room dimensions, measurements, or precise geometry from one photo.",
-            "Clearly separate detected facts from recommendations and limitations.",
-            "Return only JSON with keys: detected_facts, recommendations, limitations.",
+            "Recommend practical improvements for an existing room.",
+            "Do not invent objects not supported by detected inventory.",
+            "Do not claim exact dimensions or geometry from one photo.",
+            "Return only JSON with arrays: detected_facts, recommendations, limitations.",
+        ],
+    }
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a careful room improvement analyst. Reply with JSON only."},
+            {"role": "user", "content": json.dumps(prompt)},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1000,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + "/chat/completions",
+        data=payload,
+        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return _parse_apertus_json(result["choices"][0]["message"]["content"])
+    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Apertus request failed. Check provider configuration and response.") from exc
+
+
+def _deterministic_analysis_without_apertus(
+    selected_goal: str, rekognition_analysis: dict[str, Any]
+) -> dict[str, list[str]]:
+    inventory = rekognition_analysis.get("detected_inventory", [])
+    object_names = [str(item.get("name", "")).lower() for item in inventory]
+    recommendations = [
+        f"Prioritize the selected goal: {selected_goal}.",
+        "Clear one accessible pathway before buying or replacing furniture.",
+    ]
+    if "desk" in object_names or "monitor" in object_names:
+        recommendations.append("Group workspace items together to keep the work surface usable.")
+    if "lamp" not in object_names and "window" not in object_names:
+        recommendations.append("Assess task lighting in person; the image cannot confirm illumination levels.")
+    return {
+        "detected_facts": [f"Detected inventory: {item.get('name', 'unknown')}" for item in inventory[:5]],
+        "recommendations": recommendations,
+        "limitations": [
+            "Apertus was not configured, so these are deterministic rules based on selected goals and detected inventory.",
+            "A single image cannot provide exact room dimensions or geometry.",
         ],
     }
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=json.dumps(prompt),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.3,
-            ),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Gemini analysis failed.") from exc
 
-    return _parse_gemini_json(response.text)
-
-
-def _parse_gemini_json(response_text: str | None) -> dict[str, Any]:
+def _parse_apertus_json(response_text: str | None) -> dict[str, Any]:
     if not response_text:
-        raise HTTPException(status_code=503, detail="Gemini returned an empty response.")
+        raise HTTPException(status_code=503, detail="Apertus returned an empty response.")
 
     try:
-        parsed = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=503, detail="Gemini returned invalid JSON.") from exc
+        clean = response_text.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(clean)
+        if not isinstance(parsed, dict):
+            raise ValueError("Expected a JSON object")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Apertus returned invalid JSON.") from exc
 
     return {
         "detected_facts": _string_list(parsed.get("detected_facts")),

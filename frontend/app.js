@@ -17,6 +17,17 @@ const resultGoal = document.querySelector("#resultGoal");
 const inventoryList = document.querySelector("#inventoryList");
 const recommendationList = document.querySelector("#recommendationList");
 const limitationList = document.querySelector("#limitationList");
+const assessmentMeters = document.querySelector("#assessmentMeters");
+const assessmentMethod = document.querySelector("#assessmentMethod");
+const assessmentRules = document.querySelector("#assessmentRules");
+
+const ASSESSMENT_LABELS = {
+  design_confidence: "Design Confidence",
+  space_utilization: "Space Utilization",
+  budget_compatibility: "Budget Compatibility",
+  feasibility_confidence: "Feasibility Confidence",
+  overall_compatibility: "Overall Compatibility",
+};
 
 async function checkApiHealth() {
   try {
@@ -115,6 +126,7 @@ function renderAnalysis(data) {
 
   resultGoal.textContent = data.selected_goal || "Overall improvement";
 
+  renderAssessment(data.assessment);
   renderInventory(data.detected_inventory || []);
   renderList(recommendationList, data.recommendations || [], "No recommendations returned.");
   renderList(
@@ -122,6 +134,33 @@ function renderAnalysis(data) {
     data.limitations || [],
     "No limitations returned. Treat detections as approximate.",
   );
+}
+
+function renderAssessment(assessment) {
+  assessmentMeters.replaceChildren();
+  assessmentRules.replaceChildren();
+  const scores = assessment?.scores || {};
+
+  Object.entries(ASSESSMENT_LABELS).forEach(([key, label]) => {
+    const score = Math.max(0, Math.min(100, Number(scores[key]) || 0));
+    const meter = document.createElement("div");
+    meter.className = "assessment-meter";
+    meter.innerHTML = `
+      <div class="assessment-meter-header">
+        <span>${label}</span>
+        <output aria-label="${label}: ${score}%">${score}%</output>
+      </div>
+      <div class="meter-track" role="progressbar" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${score}">
+        <span class="meter-fill"></span>
+      </div>`;
+    assessmentMeters.appendChild(meter);
+    requestAnimationFrame(() => meter.querySelector(".meter-fill").style.width = `${score}%`);
+  });
+
+  assessmentMethod.textContent = assessment?.method === "deterministic-v1"
+    ? "Deterministic scores from your selected goals and the available image analysis."
+    : "Assessment data was unavailable for this analysis.";
+  renderList(assessmentRules, assessment?.fallback_rules || [], "No assessment rules were returned.");
 }
 
 function renderInventory(items) {
