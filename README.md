@@ -24,8 +24,10 @@ The analysis flow is:
 1. The frontend sends the selected room photo and improvement goal to FastAPI.
 2. FastAPI uploads the image to an existing S3 bucket.
 3. Amazon Rekognition detects approximate room inventory and image properties.
-4. Gemini receives the structured Rekognition output and selected goal, then
-   returns practical recommendations for an already-lived-in room.
+4. When `BEDROCK_MODEL_ID` is configured and enabled in the bucket's region,
+   Amazon Bedrock receives the photo plus structured Rekognition output and
+   returns contextual recommendations. Without it, the MVP uses its existing
+   deterministic, inventory-based recommendation fallback.
 
 Rekognition detections are approximate. Spacewise does not infer exact room
 dimensions or precise geometry from one photograph.
@@ -47,7 +49,6 @@ The API also returns these fallback rules with every assessment.
 From the project root:
 
 ```bash
-cd backend
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -64,9 +65,9 @@ Set these values in your terminal session (PowerShell example):
 ```text
 $env:AWS_REGION="us-east-1"
 $env:SPACEWISE_S3_BUCKET="your_existing_spacewise_bucket_name"
-# Optional: enables Gemini-written recommendations; no key is required for deterministic analysis.
-$env:GEMINI_API_KEY="your_gemini_api_key"
-$env:GEMINI_MODEL="gemini-1.5-flash"
+# Optional: enables live multimodal Bedrock recommendations. Choose a model
+# enabled for this AWS region and supported by the Bedrock Converse API.
+$env:BEDROCK_MODEL_ID="your_enabled_multimodal_bedrock_model_id"
 ```
 
 AWS credentials should come from your local AWS CLI profile or environment. The
@@ -75,7 +76,7 @@ application does not create buckets or infrastructure automatically.
 Run the API:
 
 ```bash
-uvicorn main:app --reload
+python -m uvicorn backend.main:app --reload
 ```
 
 The API health check will be available at:
@@ -95,23 +96,12 @@ It accepts multipart form fields:
 - `photo`: image file
 - `goal`: selected improvement goal text
 
-Open the frontend by serving the `frontend/` directory with any simple static
-server. For example:
-
-```bash
-cd frontend
-python -m http.server 5500
-```
-
-Then open:
-
-```text
-http://localhost:5500
-```
+Open `http://127.0.0.1:8000`. FastAPI serves the frontend itself, so the photo
+form and API always use the same origin.
 
 ## Environment Variables
 
 Credentials and API keys must be terminal environment variables available only to
 the backend process; they must never be committed, hardcoded, or exposed to
-frontend JavaScript. Gemini is optional: without `GEMINI_API_KEY`, the API returns
-deterministic inventory-and-goal-based recommendations and assessments.
+frontend JavaScript. Bedrock is optional: without `BEDROCK_MODEL_ID`, the API
+returns deterministic inventory-and-goal-based recommendations and assessments.

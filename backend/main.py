@@ -74,6 +74,12 @@ async def analyze_room(
 
     if len(image_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Please upload an image under 10 MB.")
+    image_format = _detect_supported_image_format(image_bytes)
+    if not image_format:
+        raise HTTPException(
+            status_code=400,
+            detail="The file is not a valid JPEG or PNG image. Amazon Rekognition accepts JPEG and PNG only.",
+        )
 
     s3_key = _build_s3_key(photo.filename)
     s3_client = _aws_client("s3")
@@ -87,16 +93,26 @@ async def analyze_room(
         bucket_name,
         s3_key,
     )
-    apertus_analysis = (
-        _analyze_with_apertus(
-            api_key=apertus_api_key,
+    bedrock_model_id = os.getenv("BEDROCK_MODEL_ID")
+    analysis = (
+        _analyze_with_bedrock(
+            region_name=bucket_region,
+            model_id=bedrock_model_id,
+            image_bytes=image_bytes,
+            image_format=image_format,
             selected_goal=goal,
             rekognition_analysis=rekognition_analysis,
         )
-        if apertus_api_key
-        else _deterministic_analysis_without_apertus(goal, rekognition_analysis)
+        if bedrock_model_id
+        else _analyze_with_apertus(
+                api_key=apertus_api_key,
+                selected_goal=goal,
+                rekognition_analysis=rekognition_analysis,
+            )
+            if apertus_api_key
+            else _deterministic_analysis_without_apertus(goal, rekognition_analysis)
     )
-    assessment = build_assessment(goal, rekognition_analysis, apertus_analysis["recommendations"])
+    assessment = build_assessment(goal, rekognition_analysis, analysis["recommendations"])
 
     return {
         "selected_goal": goal,
@@ -106,9 +122,9 @@ async def analyze_room(
         },
         "detected_inventory": rekognition_analysis["detected_inventory"],
         "image_properties": rekognition_analysis["image_properties"],
-        "recommendations": apertus_analysis.get("recommendations", []),
-        "limitations": apertus_analysis.get("limitations", []),
-        "detected_facts": apertus_analysis.get("detected_facts", []),
+        "recommendations": analysis.get("recommendations", []),
+        "limitations": analysis.get("limitations", []),
+        "detected_facts": analysis.get("detected_facts", []),
         "assessment": assessment,
     }
 
@@ -124,6 +140,14 @@ def _build_s3_key(filename: str | None) -> str:
     if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
         suffix = ".jpg"
     return f"room-uploads/{uuid.uuid4().hex}{suffix}"
+
+
+def _detect_supported_image_format(image_bytes: bytes) -> str | None:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    return None
 
 
 def _verify_bucket_exists(s3_client, bucket_name: str) -> None:
@@ -182,7 +206,8 @@ def _upload_to_s3(
             ServerSideEncryption="AES256",
         )
     except ClientError as exc:
-        raise HTTPException(status_code=503, detail="Could not upload image to S3.") from exc
+        code = str(exc.response.get("Error", {}).get("Code", "unknown"))
+        raise HTTPException(status_code=503, detail=f"Could not upload image to S3 ({code}). Check s3:PutObject permission and bucket encryption policy.") from exc
     except BotoCoreError as exc:
         raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
 
@@ -211,16 +236,10 @@ def _analyze_with_rekognition(
                 )
             except ClientError as fallback_exc:
                 _log_rekognition_client_error(fallback_exc, rekognition_client, "DetectLabels fallback")
-                raise HTTPException(
-                    status_code=503,
-                    detail="Amazon Rekognition could not analyze the uploaded image.",
-                ) from fallback_exc
+                raise HTTPException(status_code=503, detail=_rekognition_error_detail(fallback_exc, rekognition_client)) from fallback_exc
         else:
             _log_rekognition_client_error(exc, rekognition_client, "DetectLabels with image properties")
-            raise HTTPException(
-                status_code=503,
-                detail="Amazon Rekognition could not analyze the uploaded image.",
-            ) from exc
+            raise HTTPException(status_code=503, detail=_rekognition_error_detail(exc, rekognition_client)) from exc
     except BotoCoreError as exc:
         raise HTTPException(status_code=503, detail="Could not connect to Amazon Rekognition.") from exc
 
@@ -239,6 +258,16 @@ def _log_rekognition_client_error(exc: ClientError, rekognition_client, operatio
         error_code,
         region_name,
     )
+
+
+def _rekognition_error_detail(exc: ClientError, rekognition_client) -> str:
+    code = str(exc.response.get("Error", {}).get("Code", "unknown"))
+    region = getattr(rekognition_client.meta, "region_name", "unknown")
+    if code in {"AccessDeniedException", "AccessDenied"}:
+        return "Amazon Rekognition access was denied. Grant rekognition:DetectLabels and S3 read access in the bucket's region."
+    if code in {"InvalidS3ObjectException", "InvalidParameterException", "ValidationException"}:
+        return f"Amazon Rekognition rejected the S3 image ({code}) in {region}. Confirm the bucket is in {region}, the upload is JPEG/PNG, and Rekognition can read this object."
+    return f"Amazon Rekognition analysis failed ({code}) in {region}. Check the service region and IAM permissions."
 
 
 def _extract_room_inventory(labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -325,6 +354,54 @@ def _rounded_or_none(value: Any) -> float | None:
     if value is None:
         return None
     return round(float(value), 1)
+
+
+def _analyze_with_bedrock(
+    region_name: str,
+    model_id: str,
+    image_bytes: bytes,
+    image_format: str,
+    selected_goal: str,
+    rekognition_analysis: dict[str, Any],
+) -> dict[str, Any]:
+    """Use a configured multimodal Bedrock model; never invent a response on failure."""
+    control_client = _aws_client("bedrock", region_name=region_name)
+    runtime_client = _aws_client("bedrock-runtime", region_name=region_name)
+    try:
+        # This verifies that the configured model is visible in the S3/Rekognition region.
+        control_client.get_foundation_model(modelIdentifier=model_id)
+        prompt = {
+            "selected_goal": selected_goal,
+            "rekognition_inventory": rekognition_analysis.get("detected_inventory", []),
+            "instructions": "Analyze the attached room photo and Rekognition results. Do not invent objects or exact dimensions. Return JSON only with arrays named detected_facts, recommendations, and limitations.",
+        }
+        response = runtime_client.converse(
+            modelId=model_id,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
+                    {"text": json.dumps(prompt)},
+                ],
+            }],
+            inferenceConfig={"maxTokens": 900, "temperature": 0.3},
+        )
+        content = response.get("output", {}).get("message", {}).get("content", [])
+        text = next((part.get("text") for part in content if part.get("text")), None)
+        return _parse_apertus_json(text)
+    except NoCredentialsError as exc:
+        raise HTTPException(status_code=503, detail="AWS credentials were not found for Amazon Bedrock.") from exc
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", "unknown"))
+        if code in {"AccessDeniedException", "AccessDenied"}:
+            detail = "Amazon Bedrock access was denied. Allow bedrock:GetFoundationModel and bedrock:InvokeModel for BEDROCK_MODEL_ID in the configured region."
+        elif code in {"ResourceNotFoundException", "ValidationException"}:
+            detail = f"BEDROCK_MODEL_ID '{model_id}' is unavailable or unsupported in {region_name}. Confirm model access and its Converse image format support."
+        else:
+            detail = f"Amazon Bedrock analysis failed ({code}) in {region_name}. Check model access, region, and request permissions."
+        raise HTTPException(status_code=503, detail=detail) from exc
+    except BotoCoreError as exc:
+        raise HTTPException(status_code=503, detail="Could not connect to Amazon Bedrock.") from exc
 
 
 def _analyze_with_apertus(api_key: str, selected_goal: str, rekognition_analysis: dict[str, Any]) -> dict[str, Any]:
