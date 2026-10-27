@@ -91,6 +91,42 @@ The room analysis endpoint is:
 POST http://localhost:8000/analyze-room
 ```
 
+## Vercel deployment
+
+The repository root contains `app.py`, which exports the existing FastAPI
+application for Vercel. It serves `GET /health`, `POST /analyze-room`, and the
+existing frontend through the FastAPI static-files mount. Bedrock is optional:
+when no Bedrock environment variables are configured, the OpenCV-only fallback
+and all five deterministic assessment meters continue to work.
+
+`vercel.json` limits hosted uploads to 4 MB because Vercel Functions limit a
+request body to 4.5 MB. Local FastAPI retains the 10 MB default. The deployment
+uses the OpenCV 5 headless wheel because the application does not use GUI APIs.
+
+Before deploying, install the Vercel CLI, authenticate, and run a local Vercel
+build from the repository root:
+
+```powershell
+npm install --global vercel
+vercel login
+vercel build
+vercel dev
+```
+
+After checking `/health` and an OpenCV-only room upload locally, create the
+deployment deliberately with:
+
+```powershell
+vercel
+# Use this only when you intend to release to production:
+vercel --prod
+```
+
+Do not add `AWS_BEARER_TOKEN_BEDROCK` to the project files or Vercel unless AI
+interpretation is intentionally enabled later. If it is enabled, add it only
+in Vercel Project Settings → Environment Variables, together with
+`BEDROCK_MODEL_ID` and `BEDROCK_REGION`.
+
 It accepts multipart form fields:
 
 - `photo`: image file

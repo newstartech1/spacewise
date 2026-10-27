@@ -49,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("SPACEWISE_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 MAX_PIXELS = 24_000_000
 BEDROCK_CLIENT_CONFIG = Config(
     connect_timeout=10,

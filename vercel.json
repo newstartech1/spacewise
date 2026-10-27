@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "env": {
+    "SPACEWISE_MAX_UPLOAD_BYTES": "4194304"
+  },
+  "functions": {
+    "app.py": {
+      "excludeFiles": "{.pytest_cache/**,.vscode/**,main_for_review.txt,spacewise_app/**,backend/test_*.py,frontend/test_*.py}"
+    }
+  }
+}
