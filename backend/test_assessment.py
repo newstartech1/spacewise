@@ -1,6 +1,6 @@
 import unittest
 
-from assessment import build_assessment
+from backend.assessment import build_assessment
 
 
 class AssessmentTests(unittest.TestCase):

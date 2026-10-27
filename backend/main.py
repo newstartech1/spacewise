@@ -1,53 +1,336 @@
+"""Spacewise room analysis API — OpenCV 5 with optional Amazon Bedrock."""
+
 import json
 import logging
 import os
-import uuid
-from pathlib import Path
+import re
 from typing import Any
 
 import boto3
+import cv2
+import numpy as np
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import urllib.request
-import urllib.error
+from pathlib import Path
 
 from backend.assessment import build_assessment
 
+BACKEND_DIRECTORY = Path(__file__).resolve().parent
+BACKEND_ENV_FILE = BACKEND_DIRECTORY / ".env"
 
-logger = logging.getLogger(__name__)
+try:
+    from dotenv import load_dotenv
 
+    # Credentials stay in backend/.env, which is intentionally ignored by Git.
+    # Do not override explicitly supplied process settings.
+    load_dotenv(dotenv_path=BACKEND_ENV_FILE, override=False)
+except ImportError:
+    pass
 
-app = FastAPI(
-    title="Spacewise API",
-    description="Minimal API foundation for the Spacewise hackathon MVP.",
-    version="0.1.0",
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("spacewise")
 
-LOCAL_FRONTEND_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500",
-]
+app = FastAPI(title="Spacewise OpenCV Room Analysis", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=LOCAL_FRONTEND_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "SPACEWISE_ALLOWED_ORIGINS",
+            "http://localhost:8000,http://127.0.0.1:8000",
+        ).split(",")
+        if origin.strip()
+    ],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_PIXELS = 24_000_000
+BEDROCK_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=60,
+    # A failed request must not trigger several unexpected inference attempts.
+    retries={"max_attempts": 1, "mode": "standard"},
+)
+
+
+def bedrock_is_configured() -> bool:
+    """Report readiness without exposing any configuration values."""
+    values = [
+        os.getenv(name, "").strip()
+        for name in (
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "BEDROCK_MODEL_ID",
+            "BEDROCK_REGION",
+        )
+    ]
+    return all(values) and not any(
+        value.casefold().startswith(("replace_", "your_", "<"))
+        for value in values
+    )
+
+
+def clamp(value: float, minimum: float = 0, maximum: float = 100) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def analyze_with_opencv(image_bytes: bytes) -> dict[str, Any]:
+    """Measure observable image properties, not semantic object identities."""
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a readable JPEG or PNG image.",
+        )
+
+    height, width = image.shape[:2]
+
+    if width * height > MAX_PIXELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Image resolution is too large. Use a photo under 24 megapixels.",
+        )
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    laplacian_variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    edges = cv2.Canny(gray, 75, 150)
+    edge_density = float(np.count_nonzero(edges) / edges.size * 100)
+
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    meaningful_contours = sum(
+        1 for contour in contours
+        if cv2.contourArea(contour) >= (width * height * 0.0005)
+    )
+
+    saturation = float(np.mean(hsv[:, :, 1]))
+
+    # These are image-quality heuristics, not calibrated probabilities.
+    sharpness_score = round(clamp(laplacian_variance / 5))
+    contrast_score = round(clamp(contrast * 2))
+
+    if brightness < 65:
+        lighting = "Low light"
+    elif brightness > 205:
+        lighting = "Very bright"
+    else:
+        lighting = "Moderate lighting"
+
+    return {
+        "width": width,
+        "height": height,
+        "brightness": round(brightness, 2),
+        "contrast": round(contrast, 2),
+        "laplacian_variance": round(laplacian_variance, 2),
+        "edge_density_percent": round(edge_density, 2),
+        "meaningful_contours": meaningful_contours,
+        "mean_saturation": round(saturation, 2),
+        "lighting_classification": lighting,
+        "quality": {
+            "sharpness": sharpness_score,
+            "contrast": contrast_score,
+        },
+    }
+
+
+def local_recommendations(goal: str, properties: dict) -> list[str]:
+    """Transparent rule-based fallback when Bedrock is not configured."""
+    recommendations = []
+    normalized = goal.lower()
+
+    if properties["brightness"] < 90:
+        recommendations.append(
+            "Improve illumination with layered lighting and keep windows unobstructed."
+        )
+    elif properties["brightness"] > 205:
+        recommendations.append(
+            "Consider curtains or blinds to control glare in very bright areas."
+        )
+
+    if properties["laplacian_variance"] < 80:
+        recommendations.append(
+            "Retake the photograph with steadier focus for more reliable visual analysis."
+        )
+
+    if any(word in normalized for word in ("space", "storage", "clutter", "small")):
+        recommendations.append(
+            "Prioritize vertical storage and keep primary walking routes clear."
+        )
+
+    if any(word in normalized for word in ("budget", "cost", "affordable")):
+        recommendations.append(
+            "Rearrange existing furniture before purchasing new items."
+        )
+
+    if any(word in normalized for word in ("design", "style", "decor")):
+        recommendations.append(
+            "Choose a consistent color palette and avoid unnecessary visual clutter."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Evaluate furniture placement, lighting, and circulation before making changes."
+        )
+
+    return recommendations
+
+
+def combine_recommendations(
+    local: list[str], semantic: list[str], maximum: int = 12
+) -> list[str]:
+    """Retain OpenCV-derived advice while adding distinct model suggestions."""
+    combined = []
+    seen = set()
+    for recommendation in [*local, *semantic]:
+        normalized = recommendation.casefold().strip()
+        if normalized and normalized not in seen:
+            combined.append(recommendation)
+            seen.add(normalized)
+        if len(combined) >= maximum:
+            break
+    return combined
+
+
+def parse_bedrock_json(text: str) -> dict:
+    """Accept a JSON object, including one enclosed in a Markdown code fence."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        logger.warning("Bedrock returned non-JSON output")
+        return {}
+
+
+def analyze_with_bedrock(
+    image_bytes: bytes,
+    image_format: str,
+    goal: str,
+    properties: dict,
+) -> dict:
+    """Optional multimodal interpretation using a configured Bedrock model."""
+    model_id = os.getenv("BEDROCK_MODEL_ID", "").strip()
+
+    if not model_id:
+        return {}
+
+    region = os.getenv(
+        "BEDROCK_REGION",
+        os.getenv("AWS_REGION", "ap-south-1"),
+    )
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=region,
+        config=BEDROCK_CLIENT_CONFIG,
+    )
+
+    prompt = (
+        "You are a cautious interior-space analysis assistant. "
+        "Examine the attached room photograph and the measured OpenCV features. "
+        "Identify only clearly visible furniture or room objects. "
+        "Do not invent measurements, prices, hidden objects, or architectural details. "
+        "Return ONLY a JSON object with these keys: "
+        "'detected_inventory' (array of objects with 'name' and 'instances'), "
+        "'recommendations' (array of short actionable strings), "
+        "'limitations' (array of strings), "
+        "'detected_facts' (array of strings). "
+        "Do not output confidence percentages because they are not calibrated. "
+        f"Improvement goal: {goal}. "
+        f"OpenCV measurements: {json.dumps(properties)}"
+    )
+
+    response = client.converse(
+        modelId=model_id,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"text": prompt},
+                    {
+                        "image": {
+                            "format": image_format,
+                            "source": {"bytes": image_bytes},
+                        }
+                    },
+                ],
+            }
+        ],
+        inferenceConfig={"maxTokens": 1100, "temperature": 0.2},
+    )
+
+    content = response.get("output", {}).get("message", {}).get("content", [])
+    text = "\n".join(
+        block["text"] for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    )
+
+    return parse_bedrock_json(text)
+
+
+def normalize_inventory(values: Any) -> list[dict]:
+    """Keep frontend compatibility without fabricating model confidence."""
+    if not isinstance(values, list):
+        return []
+
+    inventory = []
+
+    for value in values[:25]:
+        if not isinstance(value, dict):
+            continue
+
+        name = value.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+
+        instances = value.get("instances")
+        if not isinstance(instances, int) or isinstance(instances, bool):
+            instances = None
+
+        inventory.append(
+            {
+                "name": name.strip()[:80],
+                "confidence": None,
+                "instances": instances if instances and instances > 0 else None,
+            }
+        )
+
+    return inventory
+
+
+def string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item.strip()
+        for item in value[:20]
+        if isinstance(item, str) and item.strip()
+    ]
+
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
+def health():
     return {
         "status": "ok",
-        "message": "Spacewise API is running",
+        "opencv_version": cv2.__version__,
+        "bedrock_configured": bedrock_is_configured(),
     }
 
 
@@ -55,444 +338,111 @@ def health_check() -> dict[str, str]:
 async def analyze_room(
     goal: str = Form(...),
     photo: UploadFile = File(...),
-) -> dict[str, Any]:
-    if not photo.content_type or not photo.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image file.")
-
-    bucket_name = os.getenv("SPACEWISE_S3_BUCKET")
-    if not bucket_name:
+):
+    if photo.content_type not in ("image/jpeg", "image/png"):
         raise HTTPException(
-            status_code=503,
-            detail="Missing SPACEWISE_S3_BUCKET. Configure an existing S3 bucket before analysis.",
+            status_code=400,
+            detail="Only JPEG and PNG photographs are supported.",
         )
 
-    apertus_api_key = os.getenv("APERTUS_API_KEY")
+    image_bytes = await photo.read(MAX_UPLOAD_BYTES + 1)
+    await photo.close()
 
-    image_bytes = await photo.read()
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The photograph must be smaller than 10 MB.",
+        )
+
     if not image_bytes:
         raise HTTPException(status_code=400, detail="The uploaded image is empty.")
 
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Please upload an image under 10 MB.")
-    image_format = _detect_supported_image_format(image_bytes)
-    if not image_format:
+    if len(goal.strip()) > 500:
+        raise HTTPException(status_code=400, detail="Goal description is too long.")
+
+    properties = analyze_with_opencv(image_bytes)
+
+    # Determine actual encoded format, not just the browser's MIME label.
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        image_format = "jpeg"
+    elif image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        image_format = "png"
+    else:
         raise HTTPException(
             status_code=400,
-            detail="The file is not a valid JPEG or PNG image. Amazon Rekognition accepts JPEG and PNG only.",
+            detail="The file must contain valid JPEG or PNG image data.",
         )
 
-    s3_key = _build_s3_key(photo.filename)
-    s3_client = _aws_client("s3")
+    limitations = [
+        "OpenCV image measurements do not establish real-world room dimensions.",
+        "A single photograph cannot reliably establish hidden objects or total floor area.",
+    ]
 
-    _verify_bucket_exists(s3_client, bucket_name)
-    bucket_region = _get_bucket_region(s3_client, bucket_name)
-    rekognition_client = _aws_client("rekognition", region_name=bucket_region)
-    _upload_to_s3(s3_client, bucket_name, s3_key, image_bytes, photo.content_type)
-    rekognition_analysis = _analyze_with_rekognition(
-        rekognition_client,
-        bucket_name,
-        s3_key,
-    )
-    bedrock_model_id = os.getenv("BEDROCK_MODEL_ID")
-    analysis = (
-        _analyze_with_bedrock(
-            region_name=bucket_region,
-            model_id=bedrock_model_id,
-            image_bytes=image_bytes,
-            image_format=image_format,
-            selected_goal=goal,
-            rekognition_analysis=rekognition_analysis,
-        )
-        if bedrock_model_id
-        else _analyze_with_apertus(
-                api_key=apertus_api_key,
-                selected_goal=goal,
-                rekognition_analysis=rekognition_analysis,
+    detected_inventory = []
+    detected_facts = [
+        f"Image resolution: {properties['width']} × {properties['height']} pixels.",
+        f"Lighting classification: {properties['lighting_classification']}.",
+        f"Detected external contours above the area threshold: {properties['meaningful_contours']}.",
+    ]
+
+    recommendations = local_recommendations(goal, properties)
+    analysis_method = "opencv-local"
+
+    if bedrock_is_configured():
+        try:
+            bedrock = analyze_with_bedrock(
+                image_bytes, image_format, goal, properties
             )
-            if apertus_api_key
-            else _deterministic_analysis_without_apertus(goal, rekognition_analysis)
-    )
-    assessment = build_assessment(goal, rekognition_analysis, analysis["recommendations"])
+
+            if bedrock:
+                detected_inventory = normalize_inventory(
+                    bedrock.get("detected_inventory")
+                )
+                recommendations = combine_recommendations(
+                    recommendations,
+                    string_list(bedrock.get("recommendations")),
+                )
+                limitations.extend(string_list(bedrock.get("limitations")))
+                detected_facts.extend(string_list(bedrock.get("detected_facts")))
+                analysis_method = "opencv-bedrock"
+
+        except (BotoCoreError, ClientError, NoCredentialsError) as exc:
+            logger.warning("Bedrock unavailable: %s", type(exc).__name__)
+            limitations.append(
+                "Amazon Bedrock was unavailable; local OpenCV analysis was used."
+            )
+        except Exception:
+            logger.exception("Unexpected Bedrock analysis failure")
+            limitations.append(
+                "AI interpretation failed; local OpenCV analysis was used."
+            )
+
+    vision_analysis = {
+        "detected_inventory": detected_inventory,
+        "image_properties": properties,
+    }
+
+    assessment = build_assessment(goal, vision_analysis, recommendations)
 
     return {
         "selected_goal": goal,
-        "storage": {
-            "bucket": bucket_name,
-            "key": s3_key,
-        },
-        "detected_inventory": rekognition_analysis["detected_inventory"],
-        "image_properties": rekognition_analysis["image_properties"],
-        "recommendations": analysis.get("recommendations", []),
-        "limitations": analysis.get("limitations", []),
-        "detected_facts": analysis.get("detected_facts", []),
+        "storage": {"bucket": None, "key": None},
+        "detected_inventory": detected_inventory,
+        "image_properties": properties,
+        "detected_facts": detected_facts,
+        "recommendations": recommendations,
+        "limitations": limitations,
+        "analysis_method": analysis_method,
         "assessment": assessment,
     }
 
 
-def _aws_client(service_name: str, region_name: str | None = None):
-    region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
-    session = boto3.session.Session(region_name=region_name)
-    return session.client(service_name)
+# Mount frontend last so API routes remain accessible.
+frontend_directory = BACKEND_DIRECTORY.parent / "frontend"
 
-
-def _build_s3_key(filename: str | None) -> str:
-    suffix = Path(filename or "").suffix.lower()
-    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-        suffix = ".jpg"
-    return f"room-uploads/{uuid.uuid4().hex}{suffix}"
-
-
-def _detect_supported_image_format(image_bytes: bytes) -> str | None:
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "jpeg"
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    return None
-
-
-def _verify_bucket_exists(s3_client, bucket_name: str) -> None:
-    try:
-        s3_client.head_bucket(Bucket=bucket_name)
-    except NoCredentialsError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="AWS credentials were not found. Configure the local AWS CLI or environment.",
-        ) from exc
-    except ClientError as exc:
-        error_code = str(exc.response.get("Error", {}).get("Code", ""))
-        if error_code in {"404", "NoSuchBucket", "NotFound"}:
-            detail = f"S3 bucket '{bucket_name}' does not exist. Create or configure an existing bucket."
-        elif error_code in {"403", "AccessDenied"}:
-            detail = f"Access denied for S3 bucket '{bucket_name}'. Check AWS credentials and bucket permissions."
-        else:
-            detail = f"Could not verify S3 bucket '{bucket_name}': {error_code or 'unknown AWS error'}."
-        raise HTTPException(status_code=503, detail=detail) from exc
-    except BotoCoreError as exc:
-        raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
-
-
-def _get_bucket_region(s3_client, bucket_name: str) -> str:
-    try:
-        location = s3_client.get_bucket_location(Bucket=bucket_name).get("LocationConstraint")
-    except ClientError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not determine the S3 bucket region required for Amazon Rekognition.",
-        ) from exc
-    except BotoCoreError as exc:
-        raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
-
-    # S3 represents us-east-1 as null and retained "EU" for its legacy region name.
-    if location is None:
-        return "us-east-1"
-    if location == "EU":
-        return "eu-west-1"
-    return str(location)
-
-
-def _upload_to_s3(
-    s3_client,
-    bucket_name: str,
-    s3_key: str,
-    image_bytes: bytes,
-    content_type: str,
-) -> None:
-    try:
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=s3_key,
-            Body=image_bytes,
-            ContentType=content_type,
-            ServerSideEncryption="AES256",
-        )
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", "unknown"))
-        raise HTTPException(status_code=503, detail=f"Could not upload image to S3 ({code}). Check s3:PutObject permission and bucket encryption policy.") from exc
-    except BotoCoreError as exc:
-        raise HTTPException(status_code=503, detail="Could not connect to AWS S3.") from exc
-
-
-def _analyze_with_rekognition(
-    rekognition_client,
-    bucket_name: str,
-    s3_key: str,
-) -> dict[str, Any]:
-    image = {"S3Object": {"Bucket": bucket_name, "Name": s3_key}}
-    try:
-        response = rekognition_client.detect_labels(
-            Image=image,
-            MaxLabels=75,
-            MinConfidence=55,
-            Features=["GENERAL_LABELS", "IMAGE_PROPERTIES"],
-        )
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "InvalidParameterException":
-            _log_rekognition_client_error(exc, rekognition_client, "DetectLabels with image properties")
-            try:
-                response = rekognition_client.detect_labels(
-                    Image=image,
-                    MaxLabels=75,
-                    MinConfidence=55,
-                )
-            except ClientError as fallback_exc:
-                _log_rekognition_client_error(fallback_exc, rekognition_client, "DetectLabels fallback")
-                raise HTTPException(status_code=503, detail=_rekognition_error_detail(fallback_exc, rekognition_client)) from fallback_exc
-        else:
-            _log_rekognition_client_error(exc, rekognition_client, "DetectLabels with image properties")
-            raise HTTPException(status_code=503, detail=_rekognition_error_detail(exc, rekognition_client)) from exc
-    except BotoCoreError as exc:
-        raise HTTPException(status_code=503, detail="Could not connect to Amazon Rekognition.") from exc
-
-    return {
-        "detected_inventory": _extract_room_inventory(response.get("Labels", [])),
-        "image_properties": _extract_image_properties(response.get("ImageProperties", {})),
-    }
-
-
-def _log_rekognition_client_error(exc: ClientError, rekognition_client, operation: str) -> None:
-    error_code = str(exc.response.get("Error", {}).get("Code", "unknown"))
-    region_name = getattr(rekognition_client.meta, "region_name", "unknown")
-    logger.warning(
-        "Rekognition request failed: operation=%s error_code=%s region=%s",
-        operation,
-        error_code,
-        region_name,
+if frontend_directory.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=str(frontend_directory), html=True),
+        name="frontend",
     )
-
-
-def _rekognition_error_detail(exc: ClientError, rekognition_client) -> str:
-    code = str(exc.response.get("Error", {}).get("Code", "unknown"))
-    region = getattr(rekognition_client.meta, "region_name", "unknown")
-    if code in {"AccessDeniedException", "AccessDenied"}:
-        return "Amazon Rekognition access was denied. Grant rekognition:DetectLabels and S3 read access in the bucket's region."
-    if code in {"InvalidS3ObjectException", "InvalidParameterException", "ValidationException"}:
-        return f"Amazon Rekognition rejected the S3 image ({code}) in {region}. Confirm the bucket is in {region}, the upload is JPEG/PNG, and Rekognition can read this object."
-    return f"Amazon Rekognition analysis failed ({code}) in {region}. Check the service region and IAM permissions."
-
-
-def _extract_room_inventory(labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    useful_terms = {
-        "appliance",
-        "bed",
-        "bedroom",
-        "bookcase",
-        "cabinet",
-        "chair",
-        "couch",
-        "curtain",
-        "desk",
-        "dining table",
-        "door",
-        "electronics",
-        "furniture",
-        "home decor",
-        "indoor",
-        "lamp",
-        "lighting",
-        "living room",
-        "monitor",
-        "office",
-        "pillow",
-        "plant",
-        "rug",
-        "screen",
-        "shelf",
-        "table",
-        "television",
-        "window",
-    }
-
-    inventory = []
-    for label in labels:
-        name = label.get("Name", "")
-        related_names = {
-            name.lower(),
-            *(parent.get("Name", "").lower() for parent in label.get("Parents", [])),
-            *(category.get("Name", "").lower() for category in label.get("Categories", [])),
-        }
-        if not related_names.intersection(useful_terms):
-            continue
-
-        inventory.append(
-            {
-                "name": name,
-                "confidence": round(float(label.get("Confidence", 0)), 1),
-                "instances": len(label.get("Instances", [])),
-                "parents": [parent.get("Name") for parent in label.get("Parents", []) if parent.get("Name")],
-                "categories": [
-                    category.get("Name")
-                    for category in label.get("Categories", [])
-                    if category.get("Name")
-                ],
-            }
-        )
-
-    return inventory[:30]
-
-
-def _extract_image_properties(image_properties: dict[str, Any]) -> dict[str, Any]:
-    quality = image_properties.get("Quality", {})
-    dominant_colors = image_properties.get("DominantColors", [])
-    return {
-        "quality": {
-            "brightness": _rounded_or_none(quality.get("Brightness")),
-            "sharpness": _rounded_or_none(quality.get("Sharpness")),
-            "contrast": _rounded_or_none(quality.get("Contrast")),
-        },
-        "dominant_colors": [
-            {
-                "hex": color.get("HexCode"),
-                "pixel_percent": _rounded_or_none(color.get("PixelPercent")),
-            }
-            for color in dominant_colors[:5]
-        ],
-        "note": "Image properties are approximate and do not provide exact room dimensions or geometry.",
-    }
-
-
-def _rounded_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-    return round(float(value), 1)
-
-
-def _analyze_with_bedrock(
-    region_name: str,
-    model_id: str,
-    image_bytes: bytes,
-    image_format: str,
-    selected_goal: str,
-    rekognition_analysis: dict[str, Any],
-) -> dict[str, Any]:
-    """Use a configured multimodal Bedrock model; never invent a response on failure."""
-    control_client = _aws_client("bedrock", region_name=region_name)
-    runtime_client = _aws_client("bedrock-runtime", region_name=region_name)
-    try:
-        # This verifies that the configured model is visible in the S3/Rekognition region.
-        control_client.get_foundation_model(modelIdentifier=model_id)
-        prompt = {
-            "selected_goal": selected_goal,
-            "rekognition_inventory": rekognition_analysis.get("detected_inventory", []),
-            "instructions": "Analyze the attached room photo and Rekognition results. Do not invent objects or exact dimensions. Return JSON only with arrays named detected_facts, recommendations, and limitations.",
-        }
-        response = runtime_client.converse(
-            modelId=model_id,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
-                    {"text": json.dumps(prompt)},
-                ],
-            }],
-            inferenceConfig={"maxTokens": 900, "temperature": 0.3},
-        )
-        content = response.get("output", {}).get("message", {}).get("content", [])
-        text = next((part.get("text") for part in content if part.get("text")), None)
-        return _parse_apertus_json(text)
-    except NoCredentialsError as exc:
-        raise HTTPException(status_code=503, detail="AWS credentials were not found for Amazon Bedrock.") from exc
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", "unknown"))
-        if code in {"AccessDeniedException", "AccessDenied"}:
-            detail = "Amazon Bedrock access was denied. Allow bedrock:GetFoundationModel and bedrock:InvokeModel for BEDROCK_MODEL_ID in the configured region."
-        elif code in {"ResourceNotFoundException", "ValidationException"}:
-            detail = f"BEDROCK_MODEL_ID '{model_id}' is unavailable or unsupported in {region_name}. Confirm model access and its Converse image format support."
-        else:
-            detail = f"Amazon Bedrock analysis failed ({code}) in {region_name}. Check model access, region, and request permissions."
-        raise HTTPException(status_code=503, detail=detail) from exc
-    except BotoCoreError as exc:
-        raise HTTPException(status_code=503, detail="Could not connect to Amazon Bedrock.") from exc
-
-
-def _analyze_with_apertus(api_key: str, selected_goal: str, rekognition_analysis: dict[str, Any]) -> dict[str, Any]:
-    base_url = os.getenv("APERTUS_BASE_URL", "").rstrip("/")
-    model = os.getenv("APERTUS_MODEL", "")
-    if not base_url.startswith("https://") or not model:
-        raise HTTPException(status_code=503, detail="Configure HTTPS APERTUS_BASE_URL and APERTUS_MODEL.")
-    prompt = {
-        "goal": selected_goal,
-        "rekognition_analysis": rekognition_analysis,
-        "instructions": [
-            "Recommend practical improvements for an existing room.",
-            "Do not invent objects not supported by detected inventory.",
-            "Do not claim exact dimensions or geometry from one photo.",
-            "Return only JSON with arrays: detected_facts, recommendations, limitations.",
-        ],
-    }
-    payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a careful room improvement analyst. Reply with JSON only."},
-            {"role": "user", "content": json.dumps(prompt)},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1000,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        base_url + "/chat/completions",
-        data=payload,
-        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        return _parse_apertus_json(result["choices"][0]["message"]["content"])
-    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Apertus request failed. Check provider configuration and response.") from exc
-
-
-def _deterministic_analysis_without_apertus(
-    selected_goal: str, rekognition_analysis: dict[str, Any]
-) -> dict[str, list[str]]:
-    inventory = rekognition_analysis.get("detected_inventory", [])
-    object_names = [str(item.get("name", "")).lower() for item in inventory]
-    recommendations = [
-        f"Prioritize the selected goal: {selected_goal}.",
-        "Clear one accessible pathway before buying or replacing furniture.",
-    ]
-    if "desk" in object_names or "monitor" in object_names:
-        recommendations.append("Group workspace items together to keep the work surface usable.")
-    if "lamp" not in object_names and "window" not in object_names:
-        recommendations.append("Assess task lighting in person; the image cannot confirm illumination levels.")
-    return {
-        "detected_facts": [f"Detected inventory: {item.get('name', 'unknown')}" for item in inventory[:5]],
-        "recommendations": recommendations,
-        "limitations": [
-            "Apertus was not configured, so these are deterministic rules based on selected goals and detected inventory.",
-            "A single image cannot provide exact room dimensions or geometry.",
-        ],
-    }
-
-
-def _parse_apertus_json(response_text: str | None) -> dict[str, Any]:
-    if not response_text:
-        raise HTTPException(status_code=503, detail="Apertus returned an empty response.")
-
-    try:
-        clean = response_text.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        parsed = json.loads(clean)
-        if not isinstance(parsed, dict):
-            raise ValueError("Expected a JSON object")
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Apertus returned invalid JSON.") from exc
-
-    return {
-        "detected_facts": _string_list(parsed.get("detected_facts")),
-        "recommendations": _string_list(parsed.get("recommendations")),
-        "limitations": _string_list(parsed.get("limitations")),
-    }
-
-
-def _string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if str(item).strip()]
-
-
-# Mount the existing static UI after API routes so /health, /analyze-room, and
-# /docs remain handled by FastAPI while / serves the browser application.
-FRONTEND_DIRECTORY = Path(__file__).resolve().parent.parent / "frontend"
-app.mount("/", StaticFiles(directory=FRONTEND_DIRECTORY, html=True), name="frontend")

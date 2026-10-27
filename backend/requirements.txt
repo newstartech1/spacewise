@@ -1,6 +1,9 @@
 fastapi==0.115.6
-uvicorn[standard]==0.34.0
-boto3==1.35.90
-google-genai==0.6.0
+uvicorn==0.34.0
+# Bedrock API-key (AWS_BEARER_TOKEN_BEDROCK) support requires boto3 >= 1.39.
+# Keep the major version bounded so a fresh install cannot silently take boto3 2.
+boto3>=1.39.0,<2
 python-dotenv==1.0.1
 python-multipart==0.0.20
+opencv-python==5.0.0.93
+numpy>=1.26,<3

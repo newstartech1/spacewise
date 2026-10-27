@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Spacewise</title>
+    <title>Spacewise | OpenCV Room Intelligence</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -15,36 +15,44 @@
         </div>
 
         <div class="intro-copy">
-          <p class="eyebrow">For rooms people already live in</p>
+          <p class="eyebrow">Computer vision for lived-in spaces</p>
           <h1 id="page-title">Make your current room work better.</h1>
           <p class="lede">
-            Upload a photo of an existing lived-in room, choose what you want
-            to improve, and Spacewise will help turn cluttered reality into
-            practical next steps.
+            Upload a photo of an existing room, choose what you want to
+            improve, and explore measurable visual findings alongside
+            practical recommendations.
           </p>
         </div>
 
         <div class="status-strip" aria-live="polite">
           <span class="status-dot" id="apiStatusDot"></span>
-          <span id="apiStatusText">API status not checked yet</span>
+          <span id="apiStatusText">Checking analysis service...</span>
         </div>
       </section>
 
       <section class="workspace" aria-label="Room improvement setup">
         <div class="upload-panel">
           <label class="upload-zone" for="roomPhoto">
-            <input id="roomPhoto" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" />
+            <input
+              id="roomPhoto"
+              type="file"
+              accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+            />
             <span class="upload-icon" aria-hidden="true">+</span>
             <span class="upload-title">Upload a room photo</span>
             <span class="upload-help">
-              Use a real photo of your current room, not an empty layout or new
-              construction plan.
+              Choose a JPEG or PNG photograph of an existing room.
+              Maximum file size: 10 MB.
             </span>
           </label>
 
           <div class="preview-area" id="previewArea" hidden>
             <img id="roomPreview" alt="Selected room preview" />
-            <button class="text-button" type="button" id="clearPhoto">
+            <button
+              class="text-button"
+              type="button"
+              id="clearPhoto"
+            >
               Remove photo
             </button>
           </div>
@@ -58,40 +66,70 @@
 
           <fieldset class="goal-grid">
             <legend class="sr-only">Select room improvement goals</legend>
+
             <label class="goal-option">
-              <input type="checkbox" name="goals" value="More floor space" />
+              <input
+                type="checkbox"
+                name="goals"
+                value="More floor space"
+              />
               <span>More floor space</span>
             </label>
+
             <label class="goal-option">
-              <input type="checkbox" name="goals" value="Better lighting" />
+              <input
+                type="checkbox"
+                name="goals"
+                value="Better lighting"
+              />
               <span>Better lighting</span>
             </label>
+
             <label class="goal-option">
-              <input type="checkbox" name="goals" value="Better workspace" />
+              <input
+                type="checkbox"
+                name="goals"
+                value="Better workspace"
+              />
               <span>Better workspace</span>
             </label>
+
             <label class="goal-option">
-              <input type="checkbox" name="goals" value="Better appearance" />
+              <input
+                type="checkbox"
+                name="goals"
+                value="Better appearance"
+              />
               <span>Better appearance</span>
             </label>
+
             <label class="goal-option">
-              <input type="checkbox" name="goals" value="Overall improvement" checked />
+              <input
+                type="checkbox"
+                name="goals"
+                value="Overall improvement"
+                checked
+              />
               <span>Overall improvement</span>
             </label>
           </fieldset>
 
-          <button class="primary-button" type="button" id="analyzeButton">
+          <button
+            class="primary-button"
+            type="button"
+            id="analyzeButton"
+          >
             Analyze room
           </button>
         </div>
 
         <aside class="analysis-panel" aria-live="polite">
           <div class="analysis-empty" id="analysisEmpty">
-            <p class="eyebrow">Room analysis</p>
-            <h2>Recommendations will appear here.</h2>
+            <p class="eyebrow">Room intelligence</p>
+            <h2>Room findings will appear here.</h2>
             <p>
-              Upload a lived-in room photo, choose your goal, and Spacewise
-              will analyze the room through the backend.
+              Upload a room photograph and select your improvement
+              goals to run OpenCV-based visual analysis.
             </p>
           </div>
 
@@ -99,38 +137,74 @@
             <span class="loader" aria-hidden="true"></span>
             <div>
               <p class="eyebrow">Analyzing</p>
-              <h2>Reading the room photo</h2>
+              <h2>Processing the room photograph</h2>
               <p id="analysisSummary">
-                Uploading to secure backend storage, checking room inventory,
-                and preparing recommendations.
+                Measuring lighting, contrast, image sharpness,
+                edges, and visual structure.
               </p>
             </div>
           </div>
 
           <div class="analysis-error" id="analysisError" hidden>
-            <p class="eyebrow">Analysis blocked</p>
+            <p class="eyebrow">Analysis unavailable</p>
             <h2>Spacewise could not complete the analysis.</h2>
             <p id="analysisErrorText"></p>
           </div>
 
           <div class="analysis-results" id="analysisResults" hidden>
             <div>
-              <p class="eyebrow">Selected goal</p>
+              <p class="eyebrow">Selected goals</p>
               <h2 id="resultGoal"></h2>
             </div>
 
             <div class="result-section">
               <h3>Room assessment</h3>
               <p class="assessment-note" id="assessmentMethod"></p>
-              <div class="assessment-meters" id="assessmentMeters" aria-label="Room assessment scores"></div>
+
+              <div
+                class="assessment-meters"
+                id="assessmentMeters"
+                aria-label="Room assessment scores"
+              ></div>
+
               <details class="assessment-details">
                 <summary>How these scores are calculated</summary>
                 <ul id="assessmentRules"></ul>
               </details>
             </div>
 
+            <div class="result-section" id="computerVisionSection">
+              <p class="eyebrow">OpenCV 5 analysis</p>
+              <h3>Computer Vision Findings</h3>
+
+              <p class="assessment-note">
+                Measurements extracted directly from the uploaded
+                photograph. These describe image characteristics,
+                not verified physical room dimensions.
+              </p>
+
+              <div
+                class="vision-metrics"
+                id="visionMetrics"
+                aria-label="Computer vision measurements"
+              ></div>
+
+              <p class="assessment-note" id="visionMethod">
+                Analysis method will appear here.
+              </p>
+
+              <details class="assessment-details">
+                <summary>Image observations and processing details</summary>
+                <ul id="visionFacts"></ul>
+              </details>
+            </div>
+
             <div class="result-section">
               <h3>Detected room inventory</h3>
+              <p class="assessment-note" id="inventoryStatus">
+                Semantic object recognition is available only
+                when an appropriate vision model is connected.
+              </p>
               <ul id="inventoryList"></ul>
             </div>
 

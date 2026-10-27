@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Bedrock API key for the FastAPI backend (explicit for clarity and safety).
+backend/.env
 
 # Python virtual environments
 .venv/
